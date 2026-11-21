@@ -45,6 +45,7 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include <ogg/ogg.h>
 
@@ -360,6 +361,13 @@ static void *process_header(ogg_packet *op, spx_int32_t enh_enabled, spx_int32_t
    }
    speex_decoder_ctl(st, SPEEX_SET_ENH, &enh_enabled);
    speex_decoder_ctl(st, SPEEX_GET_FRAME_SIZE, frame_size);
+   if (*frame_size < 0 || *frame_size > 2*320)
+   {
+      fprintf (stderr, "Invalid frame size %d\n", *frame_size);
+      speex_decoder_destroy(st);
+      free(header);
+      return NULL;
+   }
    *granule_frame_size = *frame_size;
 
    if (!*rate)
@@ -382,6 +390,14 @@ static void *process_header(ogg_packet *op, spx_int32_t enh_enabled, spx_int32_t
 
    speex_decoder_ctl(st, SPEEX_SET_SAMPLING_RATE, rate);
 
+   if (header->frames_per_packet < 1 || header->frames_per_packet > 10)
+   {
+      fprintf (stderr, "Invalid number of frames per packet: %d\n",
+               header->frames_per_packet);
+      speex_decoder_destroy(st);
+      free(header);
+      return NULL;
+   }
    *nframes = header->frames_per_packet;
 
    if (*channels==-1)
@@ -414,10 +430,45 @@ static void *process_header(ogg_packet *op, spx_int32_t enh_enabled, spx_int32_t
        *rate, mode->bitrate, mode->modeName);*/
    }
 
+   if (header->extra_headers > INT_MAX - 1)
+   {
+      fprintf (stderr, "Invalid number of extra headers: %d\n",
+               header->extra_headers);
+      speex_decoder_destroy(st);
+      free(header);
+      return NULL;
+   }
    *extra_headers = header->extra_headers;
 
    free(header);
    return st;
+}
+
+/* Reject Ogg page header values that would overflow the arithmetic done
+   while decoding. ogg_page_pageno()/serialno() return the raw little-endian
+   header fields, so the bytes are checked directly. A pageno of UINT32_MAX
+   makes libogg store pageno+1, and a serialno with the high byte set turns
+   negative once stored in the int ogg_stream_state::serialno. Granule
+   position validity is checked separately via ogg_page_granulepos(), since
+   the only illegal sentinel is any value below -1. */
+static int ogg_page_header_valid(const ogg_page *og)
+{
+   const unsigned char *page;
+
+   if (og->header_len < 27)
+      return 0;
+   page = (const unsigned char *)og->header;
+
+   /* serialno: keep the value representable as a non-negative int */
+   if (page[17] >= 0x80)
+      return 0;
+
+   /* pageno: UINT32_MAX would overflow pageno+1 inside libogg */
+   if (page[21] == 0xff && page[20] == 0xff &&
+       page[19] == 0xff && page[18] == 0xff)
+      return 0;
+
+   return 1;
 }
 
 int main(int argc, char **argv)
@@ -434,6 +485,7 @@ int main(int argc, char **argv)
    int packet_count=0;
    int stream_init = 0;
    int quiet = 0;
+   int error = 0;
    ogg_int64_t page_granule=0, last_granule=0;
    int skip_samples=0, page_nb_packets;
    struct option long_options[] =
@@ -618,6 +670,14 @@ int main(int argc, char **argv)
       while (ogg_sync_pageout(&oy, &og)==1)
       {
          int packet_no;
+         /* Reject pages whose serial number or page sequence number cannot
+            be handled without overflowing the decoder's bookkeeping. */
+         if (!ogg_page_header_valid(&og))
+         {
+            fprintf(stderr, "Invalid Ogg page header\n");
+            error = 1;
+            goto fail;
+         }
          if (stream_init == 0) {
             ogg_stream_init(&os, ogg_page_serialno(&og));
             stream_init = 1;
@@ -630,10 +690,36 @@ int main(int argc, char **argv)
          ogg_stream_pagein(&os, &og);
          page_granule = ogg_page_granulepos(&og);
          page_nb_packets = ogg_page_packets(&og);
-         if (page_granule>0 && frame_size)
+         /* A granulepos below -1 is never legal: -1 means that no packets
+            finish on this page, anything smaller is corrupt. */
+         if (page_granule < -1)
+         {
+            fprintf(stderr, "Invalid Ogg page granule position\n");
+            error = 1;
+            goto fail;
+         }
+         if (page_granule>0 && frame_size &&
+             (last_granule > 0 || INT64_MAX + last_granule > page_granule))
          {
             /* FIXME: shift the granule values if --force-* is specified */
-            skip_samples = frame_size*(page_nb_packets*granule_frame_size*nframes - (page_granule-last_granule))/granule_frame_size;
+            /* All intermediates are computed in 64-bit and bounded before
+               the result is narrowed to an int, so no signed overflow can
+               occur. */
+            int64_t a = page_nb_packets*granule_frame_size*(int64_t)nframes;
+            int64_t b = page_granule - last_granule;
+            if (b > a || (INT64_MAX/640 - a < -b) || (a - b) > INT64_MAX/640)
+            {
+               fprintf(stderr, "Ogg granule position overflows decoder range\n");
+               error = 1;
+               goto fail;
+            }
+            skip_samples = frame_size*(int64_t)(a - b)/granule_frame_size;
+            if (skip_samples == INT_MIN)
+            {
+               fprintf(stderr, "Ogg granule position overflows decoder range\n");
+               error = 1;
+               goto fail;
+            }
             if (ogg_page_eos(&og))
                skip_samples = -skip_samples;
             /*else if (!ogg_page_bos(&og))
@@ -658,7 +744,10 @@ int main(int argc, char **argv)
             {
                st = process_header(&op, enh_enabled, &frame_size, &granule_frame_size, &rate, &nframes, forceMode, &channels, &stereo, &extra_headers, quiet);
                if (!st)
-                  exit(1);
+               {
+                  error = 1;
+                  goto fail;
+               }
                speex_decoder_ctl(st, SPEEX_GET_LOOKAHEAD, &lookahead);
                if (!nframes)
                   nframes=1;
@@ -731,21 +820,24 @@ int main(int argc, char **argv)
                      int new_frame_size = frame_size;
                      /*printf ("packet %d %d\n", packet_no, skip_samples);*/
                      /*fprintf (stderr, "packet %d %d %d\n", packet_no, skip_samples, lookahead);*/
-                     if (packet_no == 1 && j==0 && skip_samples > 0)
+                     if (INT_MAX - lookahead > skip_samples)
                      {
-                        /*printf ("chopping first packet\n");*/
-                        new_frame_size -= skip_samples+lookahead;
-                        frame_offset = skip_samples+lookahead;
-                     }
-                     if (packet_no == page_nb_packets && skip_samples < 0)
-                     {
-                        int packet_length = nframes*frame_size+skip_samples+lookahead;
-                        new_frame_size = packet_length - j*frame_size;
-                        if (new_frame_size<0)
-                           new_frame_size = 0;
-                        if (new_frame_size>frame_size)
-                           new_frame_size = frame_size;
-                        /*printf ("chopping end: %d %d %d\n", new_frame_size, packet_length, packet_no);*/
+                        if (packet_no == 1 && j==0 && skip_samples > 0)
+                        {
+                           /*printf ("chopping first packet\n");*/
+                           new_frame_size -= skip_samples+lookahead;
+                           frame_offset = skip_samples+lookahead;
+                        }
+                        if (packet_no == page_nb_packets && skip_samples < 0)
+                        {
+                           int packet_length = nframes*frame_size+skip_samples+lookahead;
+                           new_frame_size = packet_length - j*frame_size;
+                           if (new_frame_size<0)
+                              new_frame_size = 0;
+                           if (new_frame_size>frame_size)
+                              new_frame_size = frame_size;
+                           /*printf ("chopping end: %d %d %d\n", new_frame_size, packet_length, packet_no);*/
+                        }
                      }
                      if (new_frame_size>0)
                      {
@@ -771,7 +863,7 @@ int main(int argc, char **argv)
          break;
    }
 
-   if (fout && wav_format)
+   if (!error && fout && wav_format)
    {
       if (fseek(fout,4,SEEK_SET)==0)
       {
@@ -791,9 +883,10 @@ int main(int argc, char **argv)
       }
    }
 
+fail:
    if (st)
       speex_decoder_destroy(st);
-   else
+   else if (!error)
    {
       fprintf (stderr, "This doesn't look like a Speex file\n");
    }
@@ -812,5 +905,5 @@ int main(int argc, char **argv)
    if (fout != NULL)
       fclose(fout);
 
-   return 0;
+   return error;
 }

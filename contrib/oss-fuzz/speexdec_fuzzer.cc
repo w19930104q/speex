@@ -164,6 +164,33 @@ static void cleanup(void *st, SpeexBits *bits, int stream_init, ogg_stream_state
    ogg_sync_clear(oy);
 }
 
+/* Reject Ogg page header values that cannot be handled without overflowing
+   the decoder's bookkeeping. This is checked directly on the header bytes so
+   it holds regardless of the underlying integer width (e.g. long is 32-bit
+   on LLP64): a serialno with the high byte set turns negative once stored in
+   the int ogg_stream_state::serialno, and a pageno of UINT32_MAX makes
+   libogg compute pageno+1. Granule position legality is handled where it is
+   consumed, together with the bounded skip-sample arithmetic. */
+static int ogg_page_header_valid(const ogg_page *og)
+{
+   const unsigned char *page;
+
+   if (og->header_len < 27)
+      return 0;
+   page = (const unsigned char *)og->header;
+
+   /* serialno: keep the value representable as a non-negative int */
+   if (page[17] >= 0x80)
+      return 0;
+
+   /* pageno: UINT32_MAX would overflow pageno+1 inside libogg */
+   if (page[21] == 0xff && page[20] == 0xff &&
+       page[19] == 0xff && page[18] == 0xff)
+      return 0;
+
+   return 1;
+}
+
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *fuzz_data, size_t fuzz_size)
 {
@@ -218,6 +245,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *fuzz_data, size_t fuzz_size
       while (ogg_sync_pageout(&oy, &og)==1)
       {
          int packet_no;
+
+         if (!ogg_page_header_valid(&og)) {
+            cleanup(st, &bits, stream_init, &os, &oy);
+            return 0;
+         }
 
          if (stream_init == 0) {
             ogg_stream_init(&os, ogg_page_serialno(&og));
