@@ -43,11 +43,15 @@ libspeex_la_LDFLAGS = -no-undefined -version-info @SPEEX_LT_CURRENT@:@SPEEX_LT_R
 libspeex_la_LIBADD = $(LIBM)
 
 if BUILD_BINARIES
-noinst_PROGRAMS = testenc testenc_wb testenc_uwb
+noinst_PROGRAMS = testenc testenc_wb testenc_uwb testbits
 testenc_SOURCES = testenc.c
 testenc_LDADD = libspeex.la $(LIBM)
 testenc_wb_SOURCES = testenc_wb.c
 testenc_wb_LDADD = libspeex.la $(LIBM)
 testenc_uwb_SOURCES = testenc_uwb.c
 testenc_uwb_LDADD = libspeex.la $(LIBM)
+testbits_SOURCES = testbits.c
+testbits_LDADD = libspeex.la $(LIBM)
+
+TESTS = testbits
 endif

@@ -158,6 +158,13 @@ EXPORT void speex_bits_read_whole_bytes(SpeexBits *bits, const char *chars, int 
    int i,pos;
    int nchars = nbytes/BYTES_PER_CHAR;
 
+   /* Move the unread bytes to the start of the buffer first: the space
+      reclaimed here must be taken into account when deciding how many of
+      the new bytes fit, otherwise the truncation length can go negative
+      (undefined behavior when shifted) and data still queued in the
+      stream can be dropped. */
+   speex_bits_flush(bits);
+
    if (((bits->nbBits+BITS_PER_CHAR-1)>>LOG2_BITS_PER_CHAR)+nchars > bits->buf_size)
    {
       /* Packet is larger than allocated buffer */
@@ -176,9 +183,12 @@ EXPORT void speex_bits_read_whole_bytes(SpeexBits *bits, const char *chars, int 
          speex_warning("Do not own input buffer: truncating oversize input");
          nchars=bits->buf_size-(bits->nbBits>>LOG2_BITS_PER_CHAR)-1;
       }
+      /* The buffer may have no room left at all; never copy a negative
+         number of bytes (that would shift a negative value below). */
+      if (nchars<0)
+         nchars=0;
    }
 
-   speex_bits_flush(bits);
    pos=bits->nbBits>>LOG2_BITS_PER_CHAR;
    for (i=0;i<nchars;i++)
       bits->chars[pos+i]=HTOLS(chars[i]);

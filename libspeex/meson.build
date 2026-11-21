@@ -76,4 +76,10 @@ if not get_option('test-binaries').disabled()
       dependencies: [speex_dep, libm],
       install: false)
   endforeach
+
+  testbits_exe = executable('testbits', 'testbits.c',
+    include_directories: config_inc,
+    dependencies: [speex_dep, libm],
+    install: false)
+  test('testbits', testbits_exe)
 endif
